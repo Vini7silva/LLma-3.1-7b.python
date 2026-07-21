@@ -1,0 +1,331 @@
+import os
+import sys
+import threading
+import queue
+import tkinter as tk
+from tkinter import filedialog, scrolledtext, ttk
+
+import pyttsx3
+import sounddevice as sd
+import numpy as np
+from scipy.signal import resample
+from piper import PiperVoice
+
+import lmstudio as lms
+
+# ================== CONFIGURACAO ==================
+# >>> IMPORTANTE: confira o nome exato do modelo carregado no LM Studio <<<
+MODELO_LOCAL = "qwen2.5-vl-7b-instruct"
+
+PASTA_CONHECIMENTO = os.path.join(os.path.expanduser("~"), "Desktop", "conhecimento")
+
+SYSTEM_PROMPT = (
+    "Voce e uma inteligencia artificial avancada com conhecimento enciclopedico "
+    "e capacidade de analisar imagens. Responda sempre em portugues brasileiro, "
+    "de forma clara, direta e completa."
+)
+
+BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
+
+# ================== VOZ OFFLINE (igual script original) ==================
+voice = None
+try:
+    for arquivo in os.listdir(BASE_DIR):
+        if arquivo.startswith("pt_BR-faber"):
+            caminho_completo = os.path.join(BASE_DIR, arquivo)
+            try:
+                voice = PiperVoice.load(caminho_completo)
+                if voice is not None:
+                    break
+            except Exception:
+                pass
+except Exception:
+    pass
+
+
+def falar_fallback_windows(texto):
+    try:
+        engine = pyttsx3.init(driverName='sapi5')
+        voices = engine.getProperty('voices')
+        for v in voices:
+            if "pt-BR" in v.id or "brazil" in v.name.lower():
+                engine.setProperty('voice', v.id)
+                break
+        engine.setProperty('rate', 200)
+        engine.say(texto)
+        engine.runAndWait()
+        engine.stop()
+    except Exception:
+        pass
+
+
+def falar(texto, evento_interromper=None):
+    texto_limpo = texto.strip()
+    if not texto_limpo or "<|" in texto_limpo or "parameters" in texto_limpo:
+        return
+    if evento_interromper is not None and evento_interromper.is_set():
+        return
+    if voice is not None:
+        try:
+            audio_stream = voice.synthesize_stream(texto_limpo)
+            audio_data = b"".join(audio_stream)
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            taxa_original = voice.config.sample_rate if hasattr(voice, 'config') else 22050
+            num_samples = int(len(audio_np) * 44100 / taxa_original)
+            audio_resampled = resample(audio_np, num_samples).astype(np.int16)
+            if evento_interromper is not None and evento_interromper.is_set():
+                return
+            sd.play(audio_resampled, samplerate=44100)
+            while sd.get_stream().active:
+                if evento_interromper is not None and evento_interromper.is_set():
+                    sd.stop()
+                    return
+                sd.sleep(50)
+            return
+        except Exception:
+            pass
+    falar_fallback_windows(texto_limpo)
+
+
+def _e_fim_de_frase(char, buffer):
+    return char in ".!?:" and len(buffer.strip()) > 20
+
+
+# ================== RAG LOCAL (igual script original) ==================
+def buscar_enciclopedia_local(pergunta):
+    if not os.path.exists(PASTA_CONHECIMENTO):
+        return ""
+    trechos_relevantes = []
+    palavras_busca = [p.lower() for p in pergunta.split() if len(p) > 3]
+    try:
+        list_arquivos = [f for f in os.listdir(PASTA_CONHECIMENTO) if f.endswith(".txt")]
+    except Exception:
+        return ""
+    if not list_arquivos:
+        return ""
+    for arquivo in list_arquivos:
+        caminho = os.path.join(PASTA_CONHECIMENTO, arquivo)
+        try:
+            with open(caminho, "r", encoding="utf-8") as f:
+                paragrafos = f.read().split("\n\n")
+                for para in paragrafos:
+                    para_clean = para.strip()
+                    if not para_clean:
+                        continue
+                    correspondencias = sum(1 for p in palavras_busca if p in para_clean.lower())
+                    if correspondencias > 0:
+                        trechos_relevantes.append((correspondencias, para_clean))
+        except Exception:
+            continue
+    if not trechos_relevantes:
+        return ""
+    trechos_relevantes.sort(key=lambda x: x, reverse=True)
+    contexto_final = "\n".join([texto for _, texto in trechos_relevantes[:4]])
+    return "\n\n[CONHECIMENTO ADICIONAL EXTRAIDO DOS SEUS ARQUIVOS LOCAIS]:\n" + contexto_final + "\n"
+
+
+# ================== INTERFACE GRAFICA ==================
+class AppIA:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("IA Local - Qwen2.5-VL (Offline)")
+        self.root.geometry("760x640")
+
+        self.caminho_imagem_atual = None
+        self.fila_eventos = queue.Queue()
+        self.fila_tts = queue.Queue()
+        self.evento_interromper = threading.Event()
+        self.gerando = False
+
+        # Modelo e historico de chat gerenciados pelo SDK nativo do LM Studio.
+        # Isso evita por completo o bug da API REST/OpenAI-compat com imagens
+        # em base64 (issue #1752 do lmstudio-ai/lmstudio-bug-tracker).
+        self.model = None
+        self.chat = lms.Chat(SYSTEM_PROMPT)
+        self.prediction_stream_atual = None
+
+        self.thread_tts = threading.Thread(target=self._worker_tts, daemon=True)
+        self.thread_tts.start()
+
+        # --- Topo: carregar imagem ---
+        frame_topo = ttk.Frame(root, padding=8)
+        frame_topo.pack(fill="x")
+
+        self.btn_imagem = ttk.Button(frame_topo, text="Carregar Imagem", command=self.carregar_imagem)
+        self.btn_imagem.pack(side="left")
+
+        self.lbl_imagem = ttk.Label(frame_topo, text="Nenhuma imagem selecionada", foreground="gray")
+        self.lbl_imagem.pack(side="left", padx=10)
+
+        self.btn_limpar_imagem = ttk.Button(frame_topo, text="Remover Imagem", command=self.remover_imagem)
+        self.btn_limpar_imagem.pack(side="left", padx=5)
+
+        # --- Area de conversa ---
+        self.area_conversa = scrolledtext.ScrolledText(root, wrap="word", state="disabled", font=("Consolas", 10))
+        self.area_conversa.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # --- Rodape: entrada de texto ---
+        frame_baixo = ttk.Frame(root, padding=8)
+        frame_baixo.pack(fill="x")
+
+        self.entrada_texto = ttk.Entry(frame_baixo)
+        self.entrada_texto.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.entrada_texto.bind("<Return>", lambda e: self.enviar())
+
+        self.var_falar = tk.BooleanVar(value=True)
+        self.chk_falar = ttk.Checkbutton(frame_baixo, text="Falar resposta", variable=self.var_falar)
+        self.chk_falar.pack(side="left", padx=5)
+
+        self.btn_enviar = ttk.Button(frame_baixo, text="Enviar", command=self.enviar)
+        self.btn_enviar.pack(side="left")
+
+        self.btn_interromper = ttk.Button(frame_baixo, text="Interromper", command=self.interromper)
+        self.btn_interromper.pack(side="left", padx=(5, 0))
+
+        status_voz = "Piper carregado" if voice is not None else "Fallback de voz (SAPI5)"
+        self.status_bar = ttk.Label(root, text="Status: pronto | Voz: " + status_voz, anchor="w")
+        self.status_bar.pack(fill="x", padx=8, pady=(0, 6))
+
+        self.root.after(100, self.processar_fila)
+
+    def _worker_tts(self):
+        while True:
+            frase = self.fila_tts.get()
+            if frase is None:
+                continue
+            if self.evento_interromper.is_set():
+                continue
+            falar(frase, self.evento_interromper)
+
+    def interromper(self):
+        self.evento_interromper.set()
+        sd.stop()
+        try:
+            while True:
+                self.fila_tts.get_nowait()
+        except queue.Empty:
+            pass
+        # cancela a geracao no proprio servidor do LM Studio, nao so no cliente
+        if self.prediction_stream_atual is not None:
+            try:
+                self.prediction_stream_atual.cancel()
+            except Exception:
+                pass
+        self.status_bar.config(text="Status: interrompido")
+
+    def carregar_imagem(self):
+        caminho = filedialog.askopenfilename(
+            title="Selecione uma imagem",
+            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp")]
+        )
+        if caminho:
+            self.caminho_imagem_atual = caminho
+            nome = os.path.basename(caminho)
+            self.lbl_imagem.config(text="Imagem: " + nome, foreground="black")
+
+    def remover_imagem(self):
+        self.caminho_imagem_atual = None
+        self.lbl_imagem.config(text="Nenhuma imagem selecionada", foreground="gray")
+
+    def escrever(self, texto, tag=None):
+        self.area_conversa.config(state="normal")
+        self.area_conversa.insert("end", texto, tag)
+        self.area_conversa.see("end")
+        self.area_conversa.config(state="disabled")
+
+    def enviar(self):
+        if self.gerando:
+            return
+        pergunta = self.entrada_texto.get().strip()
+        if not pergunta and not self.caminho_imagem_atual:
+            return
+
+        self.evento_interromper.clear()
+        self.entrada_texto.delete(0, "end")
+        self.gerando = True
+        self.status_bar.config(text="Status: gerando resposta...")
+
+        if self.caminho_imagem_atual:
+            self.escrever("\nVoce (com imagem: " + os.path.basename(self.caminho_imagem_atual) + "): " + pergunta + "\n")
+        else:
+            self.escrever("\nVoce: " + pergunta + "\n")
+
+        caminho_imagem = self.caminho_imagem_atual
+        falar_ativado = self.var_falar.get()
+
+        t = threading.Thread(target=self.gerar_resposta, args=(pergunta, caminho_imagem, falar_ativado), daemon=True)
+        t.start()
+
+    def gerar_resposta(self, pergunta, caminho_imagem, falar_ativado):
+        try:
+            if self.model is None:
+                self.model = lms.llm(MODELO_LOCAL)
+
+            if caminho_imagem:
+                image_handle = lms.prepare_image(caminho_imagem)
+                texto_pergunta = pergunta if pergunta else "Descreva esta imagem."
+                self.chat.add_user_message(texto_pergunta, images=[image_handle])
+            else:
+                contexto_extra = buscar_enciclopedia_local(pergunta)
+                self.chat.add_user_message(pergunta + contexto_extra)
+
+            self.fila_eventos.put(("texto", "IA: "))
+
+            prediction_stream = self.model.respond_stream(self.chat, on_message=self.chat.append)
+            self.prediction_stream_atual = prediction_stream
+
+            buffer_frase = ""
+            for fragment in prediction_stream:
+                if self.evento_interromper.is_set():
+                    break
+                pedaco = fragment.content
+                if not pedaco:
+                    continue
+                self.fila_eventos.put(("texto", pedaco))
+                buffer_frase += pedaco
+
+                if falar_ativado and any(_e_fim_de_frase(c, buffer_frase) for c in pedaco):
+                    frase = buffer_frase.strip()
+                    buffer_frase = ""
+                    if frase:
+                        self.fila_tts.put(frase)
+
+            if falar_ativado and not self.evento_interromper.is_set():
+                resto = buffer_frase.strip()
+                if resto:
+                    self.fila_tts.put(resto)
+
+            self.prediction_stream_atual = None
+            self.fila_eventos.put(("texto", "\n"))
+            self.fila_eventos.put(("fim", None))
+
+        except Exception as e:
+            self.prediction_stream_atual = None
+            self.fila_eventos.put(("texto", "\n[ERRO] " + str(e) + "\n"))
+            self.fila_eventos.put(("fim", None))
+
+    def processar_fila(self):
+        try:
+            while True:
+                tipo, dado = self.fila_eventos.get_nowait()
+                if tipo == "texto":
+                    self.escrever(dado)
+                elif tipo == "fim":
+                    self.gerando = False
+                    if not self.evento_interromper.is_set():
+                        self.status_bar.config(text="Status: pronto")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.processar_fila)
+
+
+def main():
+    if not os.path.exists(PASTA_CONHECIMENTO):
+        os.makedirs(PASTA_CONHECIMENTO)
+    root = tk.Tk()
+    app = AppIA(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
